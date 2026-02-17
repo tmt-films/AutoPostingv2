@@ -408,6 +408,14 @@ class AutoposterBot:
         @self.app.on_message(filters.text & filters.private & ~filters.command("start") & ~filters.command("stats"))
         async def text_handler(client: Client, message: Message):
             await self.handle_text_message(client, message)
+
+        @self.app.on_chat_join_request()
+        async def join_request_handler(client: Client, join_request):
+            try:
+                await client.approve_chat_join_request(join_request.chat.id, join_request.from_user.id)
+                logger.info(f"✅ Approved join request for {join_request.from_user.id} in {join_request.chat.title}")
+            except Exception as e:
+                logger.error(f"❌ Error approving join request: {e}")
     
     def is_user_admin(self, user_id: int) -> bool:
         """Check if the given user ID is in the admin list"""
@@ -451,9 +459,10 @@ Please join the channel and then send /start again."""
 
         return False
     
-    async def handle_start(self, client: Client, message: Message, is_edit: bool = False):
+    async def handle_start(self, client: Client, message: Message, is_edit: bool = False, user_id: int = None):
         """Handle /start command or return to main menu"""
-        user_id = message.from_user.id
+        if user_id is None:
+            user_id = message.from_user.id
         await self.db.add_user_if_not_exists(user_id)
         
         if not await self.check_user_subscription(user_id, message):
@@ -535,7 +544,7 @@ Forward posts between channels automatically."""
             elif data.startswith("edit_"):
                 await self.handle_edit_action(client, callback_query, data)
             elif data == "back_to_main":
-                await self.handle_start(client, callback_query.message, is_edit=True)
+                await self.handle_start(client, callback_query.message, is_edit=True, user_id=user_id)
             
         except Exception as e:
             logger.error(f"Error in callback handler: {e}")
