@@ -1,4 +1,2 @@
 pyrogram
 motor
-aiohttp
-aiofiles

@@ -13,8 +13,6 @@ from pyrogram.errors import (
     FloodWait, ChatAdminRequired, UserNotParticipant,
     MessageNotModified, ButtonDataInvalid, RPCError
 )
-import aiofiles
-import aiohttp
 import os
 from pathlib import Path
 from motor.motor_asyncio import AsyncIOMotorClient
@@ -37,24 +35,27 @@ def load_config():
     config['API_HASH'] = os.getenv('API_HASH') 
     config['BOT_TOKEN'] = os.getenv('BOT_TOKEN')
     config['FORCE_SUB_CHANNEL_ID'] = os.getenv('FORCE_SUB_CHANNEL_ID')
-    config['MONGODB_URI'] = os.getenv('MONGODB_URI', 'mongodb+srv://bery:bery@cluster0.h71gq1h.mongodb.net/?retryWrites=true&w=majority&appName=Cluster0')
-    config['DATABASE_NAME'] = os.getenv('DATABASE_NAME', 'autoposter_bot')
+    config['MONGODB_URI'] = os.getenv('MONGODB_URI')
+    config['DATABASE_NAME'] = os.getenv('DATABASE_NAME')
     admin_ids_str = os.getenv('ADMIN_IDS')
     config['ADMIN_IDS'] = [int(x.strip()) for x in admin_ids_str.split(',') if x.strip()] if admin_ids_str else []
     
-    # If not found in env vars, try to load from config.py
-    if not all([config['API_ID'], config['API_HASH'], config['BOT_TOKEN']]):
-        try:
-            from config import API_ID, API_HASH, BOT_TOKEN, FORCE_SUB_CHANNEL_ID, ADMIN_IDS, MONGODB_URI, DATABASE_NAME
-            config['API_ID'] = config['API_ID'] or API_ID
-            config['API_HASH'] = config['API_HASH'] or API_HASH
-            config['BOT_TOKEN'] = config['BOT_TOKEN'] or BOT_TOKEN
-            config['FORCE_SUB_CHANNEL_ID'] = config['FORCE_SUB_CHANNEL_ID'] or FORCE_SUB_CHANNEL_ID
-            config['ADMIN_IDS'] = config['ADMIN_IDS'] or ADMIN_IDS
-            config['MONGODB_URI'] = config['MONGODB_URI'] or MONGODB_URI
-            config['DATABASE_NAME'] = config['DATABASE_NAME'] or DATABASE_NAME
-        except ImportError:
-            pass
+    # Try to load from config.py for missing values
+    try:
+        import config as config_file
+        config['API_ID'] = config['API_ID'] or getattr(config_file, 'API_ID', None)
+        config['API_HASH'] = config['API_HASH'] or getattr(config_file, 'API_HASH', None)
+        config['BOT_TOKEN'] = config['BOT_TOKEN'] or getattr(config_file, 'BOT_TOKEN', None)
+        config['FORCE_SUB_CHANNEL_ID'] = config['FORCE_SUB_CHANNEL_ID'] or getattr(config_file, 'FORCE_SUB_CHANNEL_ID', None)
+        config['ADMIN_IDS'] = config['ADMIN_IDS'] or getattr(config_file, 'ADMIN_IDS', [])
+        config['MONGODB_URI'] = config['MONGODB_URI'] or getattr(config_file, 'MONGODB_URI', None)
+        config['DATABASE_NAME'] = config['DATABASE_NAME'] or getattr(config_file, 'DATABASE_NAME', None)
+    except ImportError:
+        pass
+
+    # Set hardcoded defaults if still missing
+    config['MONGODB_URI'] = config['MONGODB_URI'] or ''
+    config['DATABASE_NAME'] = config['DATABASE_NAME'] or 'autoposter_bot'
     
     # Validate configuration
     missing = []
@@ -374,6 +375,7 @@ class AutoposterBot:
             self.db = Database()
             self.active_jobs = {}
             self.job_locks = {}
+            self.job_tasks = {}
             self.force_sub_channel_id = FORCE_SUB_CHANNEL_ID
             self.admin_ids = ADMIN_IDS
             
@@ -416,49 +418,38 @@ class AutoposterBot:
         if not self.force_sub_channel_id:
             return True
         
-        async with aiohttp.ClientSession() as session:
+        try:
             await asyncio.sleep(FORCE_SUB_CHECK_DELAY)
+            member = await self.app.get_chat_member(self.force_sub_channel_id, user_id)
+            if member.status in [enums.ChatMemberStatus.MEMBER, enums.ChatMemberStatus.ADMINISTRATOR, enums.ChatMemberStatus.OWNER]:
+                return True
+        except UserNotParticipant:
+            pass
+        except Exception as e:
+            logger.error(f"Error checking subscription: {e}")
+            return False
+
+        try:
+            channel = await self.app.get_chat(self.force_sub_channel_id)
+            channel_name = channel.title
+            channel_link = f"https://t.me/{channel.username}" if channel.username else "https://t.me/"
             
-            url = f"https://api.telegram.org/bot{BOT_TOKEN}/getChatMember"
-            params = {
-                'chat_id': self.force_sub_channel_id,
-                'user_id': user_id
-            }
+            keyboard = InlineKeyboardMarkup([
+                [InlineKeyboardButton(f"🚀 Join {channel_name}", url=channel_link)]
+            ])
             
-            try:
-                async with session.get(url, params=params) as response:
-                    if response.status == 200:
-                        data = await response.json()
-                        if data.get('ok'):
-                            status = data['result']['status']
-                            if status in ['member', 'administrator', 'creator']:
-                                return True
-                            else:
-                                channel_info = await self.get_channel_info(session, self.app, self.force_sub_channel_id)
-                                channel_name = channel_info['title'] if channel_info else "the required channel"
-                                channel_link = f"https://t.me/{channel_info['username']}" if channel_info and channel_info.get('username') else "https://t.me/"
-                                
-                                keyboard = InlineKeyboardMarkup([
-                                    [InlineKeyboardButton(f"🚀 Join {channel_name}", url=channel_link)]
-                                ])
-                                
-                                text = f"""👋 Hello! To use this bot, you must join our channel: <b>{channel_name}</b>.
+            text = f"""👋 Hello! To use this bot, you must join our channel: <b>{channel_name}</b>.
 
 Please join the channel and then send /start again."""
-                                
-                                if isinstance(message_obj, Message):
-                                    await message_obj.reply_text(text, reply_markup=keyboard, parse_mode=enums.ParseMode.HTML)
-                                elif isinstance(message_obj, CallbackQuery):
-                                    await message_obj.message.edit_text(text, reply_markup=keyboard, parse_mode=enums.ParseMode.HTML)
-                                return False
-                        else:
-                            logger.error(f"Telegram API error checking subscription: {data.get('description', 'Unknown error')}")
-                            return False
-                    else:
-                        return False
-            except Exception as e:
-                logger.error(f"Exception checking subscription: {e}")
-                return False
+
+            if isinstance(message_obj, Message):
+                await message_obj.reply_text(text, reply_markup=keyboard, parse_mode=enums.ParseMode.HTML)
+            elif isinstance(message_obj, CallbackQuery):
+                await message_obj.message.edit_text(text, reply_markup=keyboard, parse_mode=enums.ParseMode.HTML)
+        except Exception as e:
+            logger.error(f"Error showing subscription message: {e}")
+
+        return False
     
     async def handle_start(self, client: Client, message: Message, is_edit: bool = False):
         """Handle /start command or return to main menu"""
@@ -727,50 +718,49 @@ You can send:
         progress_msg = await message.reply_text("🔍 Checking channel access...")
         
         try:
-            async with aiohttp.ClientSession() as session:
-                can_access = await self.test_channel_access(session, channel_id)
-                if not can_access:
-                    await progress_msg.edit_text(
-                        "❌ Cannot access this channel. Please check:\n"
-                        "• Channel ID/username is correct\n"
-                        "• Channel exists and is accessible\n"
-                        "• Bot has been added to the channel"
-                    )
-                    return
-                
-                channel_info = await self.get_channel_info(session, client, channel_id)
-                if not channel_info:
-                    await progress_msg.edit_text("❌ Cannot get channel information. Please try again.")
-                    return
-                
-                await progress_msg.edit_text("🔍 Checking admin permissions...")
-                is_admin = await self.check_admin_status(session, client, channel_id)
-                if not is_admin:
-                    await progress_msg.edit_text(
-                        f"❌ Bot is not admin in <b>{channel_info['title']}</b>\n\n"
-                        "Please:\n"
-                        "1. Add the bot to the channel as admin\n"
-                        "2. Give permissions: Post Messages, Delete Messages\n"
-                        "3. Try again\n\n"
-                        f"Channel: <code>{channel_id}</code>",
-                        parse_mode=enums.ParseMode.HTML
-                    )
-                    return
-                
-                state["source_channel"] = channel_id
-                state["source_info"] = channel_info
-                state["step"] = "target_channel"
-                await self.db.save_user_state(message.from_user.id, state)
-                
-                text = f"""✅ Source channel verified: <b>{channel_info['title']}</b>
+            can_access = await self.test_channel_access(channel_id)
+            if not can_access:
+                await progress_msg.edit_text(
+                    "❌ Cannot access this channel. Please check:\n"
+                    "• Channel ID/username is correct\n"
+                    "• Channel exists and is accessible\n"
+                    "• Bot has been added to the channel"
+                )
+                return
+
+            channel_info = await self.get_channel_info(channel_id)
+            if not channel_info:
+                await progress_msg.edit_text("❌ Cannot get channel information. Please try again.")
+                return
+
+            await progress_msg.edit_text("🔍 Checking admin permissions...")
+            is_admin = await self.check_admin_status(channel_id)
+            if not is_admin:
+                await progress_msg.edit_text(
+                    f"❌ Bot is not admin in <b>{channel_info['title']}</b>\n\n"
+                    "Please:\n"
+                    "1. Add the bot to the channel as admin\n"
+                    "2. Give permissions: Post Messages, Delete Messages\n"
+                    "3. Try again\n\n"
+                    f"Channel: <code>{channel_id}</code>",
+                    parse_mode=enums.ParseMode.HTML
+                )
+                return
+
+            state["source_channel"] = channel_id
+            state["source_info"] = channel_info
+            state["step"] = "target_channel"
+            await self.db.save_user_state(message.from_user.id, state)
+
+            text = f"""✅ Source channel verified: <b>{channel_info['title']}</b>
 
 <b>Step 3:</b> Enter the target channel ID or username
 This is where the posts will be forwarded to.
 
 ⚠️ <b>Important:</b> Make sure the bot is admin in this channel too!
 """
-                
-                await progress_msg.edit_text(text, parse_mode=enums.ParseMode.HTML)
+
+            await progress_msg.edit_text(text, parse_mode=enums.ParseMode.HTML)
                 
         except Exception as e:
             logger.error(f"Error checking source channel: {e}")
@@ -788,56 +778,55 @@ This is where the posts will be forwarded to.
         progress_msg = await message.reply_text("🔍 Checking channel access...")
         
         try:
-            async with aiohttp.ClientSession() as session:
-                can_access = await self.test_channel_access(session, channel_id)
-                if not can_access:
-                    await progress_msg.edit_text(
-                        "❌ Cannot access this channel. Please check:\n"
-                        "• Channel ID/username is correct\n"
-                        "• Channel exists and is accessible\n"
-                        "• Bot has been added to the channel"
-                    )
-                    return
-                
-                channel_info = await self.get_channel_info(session, client, channel_id)
-                if not channel_info:
-                    await progress_msg.edit_text("❌ Cannot get channel information. Please try again.")
-                    return
-                
-                await progress_msg.edit_text("🔍 Checking admin permissions...")
-                is_admin = await self.check_admin_status(session, client, channel_id)
-                if not is_admin:
-                    await progress_msg.edit_text(
-                        f"❌ Bot is not admin in <b>{channel_info['title']}</b>\n\n"
-                        "Please:\n"
-                        "1. Add the bot to the channel as admin\n"
-                        "2. Give permissions: Post Messages, Delete Messages\n"
-                        "3. Try again\n\n"
-                        f"Channel: <code>{channel_id}</code>",
-                        parse_mode=enums.ParseMode.HTML
-                    )
-                    return
-                
-                state["target_channel"] = channel_id
-                state["target_info"] = channel_info
-                await self.db.save_user_state(message.from_user.id, state)
-                
-                keyboard = InlineKeyboardMarkup([
-                    [InlineKeyboardButton("📷 Media Only", callback_data="filter_media")],
-                    [InlineKeyboardButton("📝 Text Only", callback_data="filter_text")],
-                    [InlineKeyboardButton("📋 All Posts", callback_data="filter_all")]
-                ])
-                
-                text = f"""✅ Target channel verified: <b>{channel_info['title']}</b>
+            can_access = await self.test_channel_access(channel_id)
+            if not can_access:
+                await progress_msg.edit_text(
+                    "❌ Cannot access this channel. Please check:\n"
+                    "• Channel ID/username is correct\n"
+                    "• Channel exists and is accessible\n"
+                    "• Bot has been added to the channel"
+                )
+                return
+
+            channel_info = await self.get_channel_info(channel_id)
+            if not channel_info:
+                await progress_msg.edit_text("❌ Cannot get channel information. Please try again.")
+                return
+
+            await progress_msg.edit_text("🔍 Checking admin permissions...")
+            is_admin = await self.check_admin_status(channel_id)
+            if not is_admin:
+                await progress_msg.edit_text(
+                    f"❌ Bot is not admin in <b>{channel_info['title']}</b>\n\n"
+                    "Please:\n"
+                    "1. Add the bot to the channel as admin\n"
+                    "2. Give permissions: Post Messages, Delete Messages\n"
+                    "3. Try again\n\n"
+                    f"Channel: <code>{channel_id}</code>",
+                    parse_mode=enums.ParseMode.HTML
+                )
+                return
+
+            state["target_channel"] = channel_id
+            state["target_info"] = channel_info
+            await self.db.save_user_state(message.from_user.id, state)
+
+            keyboard = InlineKeyboardMarkup([
+                [InlineKeyboardButton("📷 Media Only", callback_data="filter_media")],
+                [InlineKeyboardButton("📝 Text Only", callback_data="filter_text")],
+                [InlineKeyboardButton("📋 All Posts", callback_data="filter_all")]
+            ])
+
+            text = f"""✅ Target channel verified: <b>{channel_info['title']}</b>
 
 <b>Step 4:</b> Choose what type of posts to forward:
 """
-                
-                await progress_msg.edit_text(
-                    text,
-                    reply_markup=keyboard,
-                    parse_mode=enums.ParseMode.HTML
-                )
+
+            await progress_msg.edit_text(
+                text,
+                reply_markup=keyboard,
+                parse_mode=enums.ParseMode.HTML
+            )
                 
         except Exception as e:
             logger.error(f"Error checking target channel: {e}")
@@ -1201,11 +1190,10 @@ Ready to start forwarding!
         
         await self.db.update_job_status(job_id, True)
         
-        if job_id not in self.active_jobs:
+        if job_id not in self.active_jobs or not self.active_jobs[job_id]:
             self.active_jobs[job_id] = True
             self.job_locks[job_id] = asyncio.Lock()
-            
-            asyncio.create_task(self.run_job(client, job_id))
+            self.job_tasks[job_id] = asyncio.create_task(self.run_job(client, job_id))
         
         await callback_query.edit_message_text(
             f"✅ Job <b>{job['job_name']}</b> started successfully!",
@@ -1373,14 +1361,13 @@ Are you sure you want to delete the job <b>"{job['job_name']}"</b>?
                     if not job or not job['is_active']:
                         break
                     
-                    async with aiohttp.ClientSession() as session:
-                        await self.process_job_batch(client, job, session)
-                        
-                        if job['delete_time'] > 0:
-                            await self.cleanup_old_messages(client, job, session)
+                    await self.process_job_batch(job)
+
+                    if job['delete_time'] > 0:
+                        await self.cleanup_old_messages(job)
                 
                 if job['end_post_id'] != 999999 and job['last_forwarded_id'] >= job['end_post_id']:
-                    logger.info(f"Job {job['id']}: Reached end of specified posts ({job['last_forwarded_id']}/{job['end_post_id']}). Pausing until new posts are available or job is reset.")
+                    logger.info(f"Job {job['id']}: Reached end of specified posts. Pausing.")
                     await asyncio.sleep(job['recurring_time'] * 60 * 2)
                 else:
                     await asyncio.sleep(job['recurring_time'] * 60)
@@ -1399,226 +1386,108 @@ Are you sure you want to delete the job <b>"{job['job_name']}"</b>?
         
         logger.info(f"Job {job_id} stopped")
     
-    async def process_job_batch(self, client: Client, job: dict, session: aiohttp.ClientSession):
-        """Process a batch of messages for forwarding using raw API workaround"""
+    async def process_job_batch(self, job: dict):
+        """Process a batch of messages for forwarding using optimized Pyrogram methods"""
         current_message_id = max(job['last_forwarded_id'] + 1, job['start_post_id'])
         messages_to_forward = []
         last_checked_message_id = job['last_forwarded_id']
+
+        # Check up to 5x batch size or 100 messages to find matching ones
+        fetch_limit = min(job['batch_size'] * 5, 100)
+
         logger.info(f"Job {job['id']}: Starting batch search from message ID {current_message_id}")
         
         while len(messages_to_forward) < job['batch_size']:
             if job['end_post_id'] != 999999 and current_message_id > job['end_post_id']:
-                logger.info(f"Job {job['id']}: Reached end of range ({current_message_id-1} vs {job['end_post_id']}). No more messages to process in this range.")
                 break
             
+            end_id = current_message_id + fetch_limit
+            if job['end_post_id'] != 999999:
+                end_id = min(end_id, job['end_post_id'] + 1)
+
+            message_ids = list(range(current_message_id, end_id))
+            if not message_ids:
+                break
+                
             try:
-                forward_url = f"https://api.telegram.org/bot{BOT_TOKEN}/forwardMessage"
-                forward_params = {
-                    'chat_id': job['target_channel_id'],
-                    'from_chat_id': job['source_channel_id'],
-                    'message_id': current_message_id
-                }
+                msgs = await self.app.get_messages(job['source_channel_id'], message_ids)
+                if not isinstance(msgs, list):
+                    msgs = [msgs]
                 
-                forward_response = await session.post(forward_url, data=forward_params)
-                forward_data = await forward_response.json()
-                last_checked_message_id = current_message_id
+                for msg in msgs:
+                    last_checked_message_id = msg.id
+                    if msg.empty:
+                        continue
+
+                    if self.message_matches_filter(msg, job['filter_type']):
+                        messages_to_forward.append(msg)
+                        if len(messages_to_forward) >= job['batch_size']:
+                            break
                 
-                if not forward_data.get('ok'):
-                    logger.debug(f"Job {job['id']}: Message {current_message_id} not found or cannot be forwarded (error: {forward_data.get('description', 'Unknown')})")
-                    current_message_id += 1
-                    await asyncio.sleep(BATCH_DELAY)
-                    continue
-                
-                forwarded_msg_result = forward_data['result']
-                temp_forwarded_msg_id = forwarded_msg_result['message_id']
-                
-                delete_url = f"https://api.telegram.org/bot{BOT_TOKEN}/deleteMessage"
-                delete_params = {
-                    'chat_id': job['target_channel_id'],
-                    'message_id': temp_forwarded_msg_id
-                }
-                await session.post(delete_url, data=delete_params)
-                
-                message_type = self.get_message_type_from_raw_data(forwarded_msg_result)
-                if self.message_matches_filter_raw(message_type, job['filter_type']):
-                    messages_to_forward.append((current_message_id, forwarded_msg_result))
-                    logger.debug(f"Job {job['id']}: Found matching message {current_message_id} (type: {message_type})")
-                else:
-                    logger.debug(f"Job {job['id']}: Message {current_message_id} (type: {message_type}) doesn't match filter {job['filter_type']}")
-                
-                current_message_id += 1
-                await asyncio.sleep(BATCH_DELAY)
+                current_message_id = last_checked_message_id + 1
+                if len(messages_to_forward) < job['batch_size'] and job['end_post_id'] == 999999:
+                    # If we didn't find enough and it's ongoing, stop for now to wait for new posts
+                    break
                 
             except FloodWait as e:
                 logger.warning(f"FloodWait while searching for messages in job {job['id']}: {e.value} seconds")
                 await asyncio.sleep(e.value)
-                continue
             except Exception as e:
-                logger.error(f"Error searching for message {current_message_id} in job {job['id']}: {e}")
+                logger.error(f"Error searching for messages in job {job['id']}: {e}")
                 current_message_id += 1
                 await asyncio.sleep(BATCH_DELAY)
-                continue
         
         forwarded_count = 0
-        if messages_to_forward:
-            logger.info(f"Job {job['id']}: Forwarding {len(messages_to_forward)} messages.")
-            for original_id, msg_data in messages_to_forward:
-                try:
-                    sent_message_obj = await self.send_custom_message(session, job, msg_data)
-                    if sent_message_obj:
-                        await self.db.add_forwarded_message(job['id'], original_id, sent_message_obj.id)
-                        forwarded_count += 1
-                        logger.info(f"Job {job['id']}: Successfully forwarded message {original_id}")
-                    else:
-                        logger.warning(f"Job {job['id']}: Failed to send custom message {original_id}")
-                    await asyncio.sleep(FORWARD_DELAY)
-                except FloodWait as e:
-                    logger.warning(f"FloodWait during forwarding in job {job['id']}: {e.value} seconds")
-                    await asyncio.sleep(e.value)
-                    break
-                except Exception as e:
-                    logger.error(f"Error forwarding message {original_id} in job {job['id']}: {e}")
-                    continue
+        for msg in messages_to_forward:
+            try:
+                sent_message = await self.send_custom_message(job, msg)
+                if sent_message:
+                    await self.db.add_forwarded_message(job['id'], msg.id, sent_message.id)
+                    forwarded_count += 1
+                await asyncio.sleep(FORWARD_DELAY)
+            except FloodWait as e:
+                logger.warning(f"FloodWait during forwarding in job {job['id']}: {e.value} seconds")
+                await asyncio.sleep(e.value)
+                break
+            except Exception as e:
+                logger.error(f"Error forwarding message {msg.id} in job {job['id']}: {e}")
         
         await self.db.update_last_forwarded(job['id'], last_checked_message_id)
-        logger.info(f"Job {job['id']}: Forwarded {forwarded_count} messages in this batch. Last checked message ID: {last_checked_message_id}")
+        logger.info(f"Job {job['id']}: Forwarded {forwarded_count} messages in this batch.")
     
-    def get_message_type_from_raw_data(self, raw_msg_data: dict) -> str:
-        """Determine message type from raw Telegram Bot API message data"""
-        if 'photo' in raw_msg_data:
-            return 'photo'
-        elif 'video' in raw_msg_data:
-            return 'video'
-        elif 'document' in raw_msg_data:
-            return 'document'
-        elif 'audio' in raw_msg_data:
-            return 'audio'
-        elif 'voice' in raw_msg_data:
-            return 'voice'
-        elif 'video_note' in raw_msg_data:
-            return 'video_note'
-        elif 'animation' in raw_msg_data:
-            return 'animation'
-        elif 'sticker' in raw_msg_data:
-            return 'sticker'
-        elif 'text' in raw_msg_data:
-            return 'text'
-        else:
-            return 'unknown'
-    
-    def message_matches_filter_raw(self, message_type: str, filter_type: str) -> bool:
-        """Check if message matches the filter criteria using raw message type"""
+    def message_matches_filter(self, msg: Message, filter_type: str) -> bool:
+        """Check if message matches the filter criteria"""
         if filter_type == "all":
             return True
         elif filter_type == "media":
-            media_types = ['photo', 'video', 'document', 'audio', 'voice', 'video_note', 'animation', 'sticker']
-            return message_type in media_types
+            return bool(msg.media)
         elif filter_type == "text":
-            return message_type == 'text'
+            return bool(msg.text and not msg.media)
         return False
     
-    async def send_custom_message(self, session: aiohttp.ClientSession, job: dict, original_msg_data: dict):
-        """Send message with custom caption and button using raw Bot API"""
+    async def send_custom_message(self, job: dict, msg: Message):
+        """Send message with custom caption and button using Pyrogram"""
         try:
-            base_url = f"https://api.telegram.org/bot{BOT_TOKEN}"
-            
-            caption = job['custom_caption'] if job['custom_caption'] else (
-                original_msg_data.get('caption', '') or original_msg_data.get('text', '')
-            )
+            caption = job['custom_caption'] if job['custom_caption'] else msg.caption
             
             reply_markup = None
             if job['button_text'] and job['button_url']:
-                reply_markup = {
-                    "inline_keyboard": [[{
-                        "text": job['button_text'],
-                        "url": job['button_url']
-                    }]]
-                }
+                reply_markup = InlineKeyboardMarkup([
+                    [InlineKeyboardButton(job['button_text'], url=job['button_url'])]
+                ])
             
-            params = {
-                'chat_id': job['target_channel_id'],
-                'parse_mode': 'HTML'
-            }
-            
-            if reply_markup:
-                params['reply_markup'] = json.dumps(reply_markup)
-            
-            message_type = self.get_message_type_from_raw_data(original_msg_data)
-            
-            if message_type == 'photo':
-                params['photo'] = original_msg_data['photo'][-1]['file_id']
-                if caption:
-                    params['caption'] = caption
-                url = f"{base_url}/sendPhoto"
-            
-            elif message_type == 'video':
-                params['video'] = original_msg_data['video']['file_id']
-                if caption:
-                    params['caption'] = caption
-                url = f"{base_url}/sendVideo"
-            
-            elif message_type == 'document':
-                params['document'] = original_msg_data['document']['file_id']
-                if caption:
-                    params['caption'] = caption
-                url = f"{base_url}/sendDocument"
-            
-            elif message_type == 'audio':
-                params['audio'] = original_msg_data['audio']['file_id']
-                if caption:
-                    params['caption'] = caption
-                url = f"{base_url}/sendAudio"
-            
-            elif message_type == 'voice':
-                params['voice'] = original_msg_data['voice']['file_id']
-                if caption:
-                    params['caption'] = caption
-                url = f"{base_url}/sendVoice"
-            
-            elif message_type == 'animation':
-                params['animation'] = original_msg_data['animation']['file_id']
-                if caption:
-                    params['caption'] = caption
-                url = f"{base_url}/sendAnimation"
-            
-            elif message_type == 'sticker':
-                params['sticker'] = original_msg_data['sticker']['file_id']
-                url = f"{base_url}/sendSticker"
-            
-            elif message_type == 'video_note':
-                params['video_note'] = original_msg_data['video_note']['file_id']
-                url = f"{base_url}/sendVideoNote"
-            
-            elif message_type == 'text':
-                params['text'] = caption if caption else original_msg_data.get('text', '')
-                url = f"{base_url}/sendMessage"
-            else:
-                logger.warning(f"Unknown message type for sending: {message_type}")
-                return None
-            
-            async with session.post(url, data=params) as response:
-                if response.status == 200:
-                    data = await response.json()
-                    if data.get('ok'):
-                        result = data.get('result', {})
-                        
-                        class SimpleMessage:
-                            def __init__(self, msg_id):
-                                self.id = msg_id
-                        
-                        return SimpleMessage(result.get('message_id'))
-                else:
-                    error_text = await response.text()
-                    logger.error(f"Failed to send message: {response.status} - {error_text}")
-            
-            return None
-            
+            # copy() handles both text (as text) and media (as caption) correctly
+            return await msg.copy(
+                chat_id=job['target_channel_id'],
+                caption=caption,
+                reply_markup=reply_markup
+            )
         except Exception as e:
-            logger.error(f"Error sending custom message: {e}")
+            logger.error(f"Error sending custom message for job {job['id']}: {e}")
             return None
     
-    async def cleanup_old_messages(self, client: Client, job: dict, session: aiohttp.ClientSession):
-        """Delete old forwarded messages using raw Bot API"""
+    async def cleanup_old_messages(self, job: dict):
+        """Delete old forwarded messages using Pyrogram"""
         try:
             old_messages = await self.db.get_old_forwarded_messages(job['id'], job['delete_time'])
             
@@ -1627,117 +1496,44 @@ Are you sure you want to delete the job <b>"{job['job_name']}"</b>?
             
             logger.info(f"Job {job['id']}: Cleaning up {len(old_messages)} old messages")
             
-            url = f"https://api.telegram.org/bot{BOT_TOKEN}/deleteMessage"
-            deleted_count = 0
+            await self.app.delete_messages(job['target_channel_id'], old_messages)
             
-            for message_id in old_messages:
-                try:
-                    params = {
-                        'chat_id': job['target_channel_id'],
-                        'message_id': message_id
-                    }
-                    
-                    async with session.post(url, data=params) as response:
-                        if response.status == 429:
-                            retry_after = int(response.headers.get('Retry-After', 1))
-                            await asyncio.sleep(retry_after)
-                        elif response.status == 200:
-                            data = await response.json()
-                            if data.get('ok'):
-                                deleted_count += 1
-                                logger.debug(f"Deleted old message {message_id}")
-                    
-                    await asyncio.sleep(DELETE_DELAY)
-                    
-                except Exception as e:
-                    logger.error(f"Error deleting message {message_id}: {e}")
-            
-            logger.info(f"Job {job['id']}: Successfully deleted {deleted_count} old messages")
-            
+            logger.info(f"Job {job['id']}: Successfully deleted old messages")
         except Exception as e:
-            logger.error(f"Error in cleanup: {e}")
+            logger.error(f"Error in cleanup for job {job['id']}: {e}")
     
-    async def test_channel_access(self, session: aiohttp.ClientSession, channel_id: Union[str, int]) -> bool:
-        """Test if bot can access the channel using raw API"""
+    async def test_channel_access(self, channel_id: Union[str, int]) -> bool:
+        """Test if bot can access the channel"""
         try:
-            url = f"https://api.telegram.org/bot{BOT_TOKEN}/getChat"
-            params = {'chat_id': channel_id}
-            
-            async with session.get(url, params=params) as response:
-                if response.status == 200:
-                    data = await response.json()
-                    return data.get('ok', False)
-                return False
-                
+            await self.app.get_chat(channel_id)
+            return True
         except Exception as e:
-            logger.error(f"Error testing channel access: {e}")
+            logger.error(f"Error testing channel access for {channel_id}: {e}")
             return False
     
-    async def get_channel_info(self, session: aiohttp.ClientSession, client: Client, channel_id: Union[str, int]) -> Optional[dict]:
-        """Get channel information using raw Bot API"""
+    async def get_channel_info(self, channel_id: Union[str, int]) -> Optional[dict]:
+        """Get channel information"""
         try:
-            url = f"https://api.telegram.org/bot{BOT_TOKEN}/getChat"
-            params = {'chat_id': channel_id}
-            
-            async with session.get(url, params=params) as response:
-                if response.status == 200:
-                    data = await response.json()
-                    if data.get('ok'):
-                        chat = data.get('result', {})
-                        return {
-                            'id': chat.get('id'),
-                            'title': chat.get('title', chat.get('first_name', 'Unknown')),
-                            'type': chat.get('type', 'unknown'),
-                            'username': chat.get('username', '')
-                        }
-                return None
-                
+            chat = await self.app.get_chat(channel_id)
+            return {
+                'id': chat.id,
+                'title': chat.title or chat.first_name or 'Unknown',
+                'type': str(chat.type),
+                'username': chat.username or ''
+            }
         except Exception as e:
-            logger.error(f"Error getting channel info: {e}")
+            logger.error(f"Error getting channel info for {channel_id}: {e}")
             return None
     
-    async def check_admin_status(self, session: aiohttp.ClientSession, client: Client, channel_id: Union[str, int]) -> bool:
-        """Check if bot is admin in the channel using raw Bot API"""
+    async def check_admin_status(self, channel_id: Union[str, int]) -> bool:
+        """Check if bot is admin in the channel"""
         try:
             await asyncio.sleep(ADMIN_DELAY)
-            
-            bot_url = f"https://api.telegram.org/bot{BOT_TOKEN}/getMe"
-            async with session.get(bot_url) as response:
-                if response.status != 200:
-                    return False
-                bot_data = await response.json()
-                if not bot_data.get('ok'):
-                    return False
-                bot_id = bot_data['result']['id']
-            
-            admin_url = f"https://api.telegram.org/bot{BOT_TOKEN}/getChatMember"
-            params = {
-                'chat_id': channel_id,
-                'user_id': bot_id
-            }
-            
-            async with session.get(admin_url, params=params) as response:
-                if response.status == 200:
-                    data = await response.json()
-                    if data.get('ok'):
-                        member = data.get('result', {})
-                        status = member.get('status', '')
-                        return status in ['administrator', 'creator']
-                elif response.status == 400:
-                    try:
-                        chat_url = f"https://api.telegram.org/bot{BOT_TOKEN}/getChat"
-                        chat_params = {'chat_id': channel_id}
-                        async with session.get(chat_url, params=chat_params) as chat_response:
-                            if chat_response.status == 200:
-                                chat_data = await chat_response.json()
-                                return chat_data.get('ok', False)
-                    except:
-                        pass
-                
-                return False
-                
+            me = await self.app.get_me()
+            member = await self.app.get_chat_member(channel_id, me.id)
+            return member.status in [enums.ChatMemberStatus.ADMINISTRATOR, enums.ChatMemberStatus.OWNER]
         except Exception as e:
-            logger.error(f"Error checking admin status: {e}")
+            logger.error(f"Error checking admin status for {channel_id}: {e}")
             return False
     
     def extract_channel_id(self, text: str) -> Optional[Union[str, int]]:
@@ -1771,8 +1567,20 @@ Are you sure you want to delete the job <b>"{job['job_name']}"</b>?
         logger.info("Starting Autoposter Bot...")
         await self.db.connect()
         await self.app.start()
-        logger.info("Bot started successfully!")
         
+        # Resume active jobs
+        try:
+            cursor = self.db.db.jobs.find({'is_active': True})
+            async for job in cursor:
+                job_id = str(job['_id'])
+                self.active_jobs[job_id] = True
+                self.job_locks[job_id] = asyncio.Lock()
+                self.job_tasks[job_id] = asyncio.create_task(self.run_job(self.app, job_id))
+                logger.info(f"Resumed active job: {job.get('job_name')} ({job_id})")
+        except Exception as e:
+            logger.error(f"Error resuming jobs: {e}")
+
+        logger.info("Bot started successfully!")
         await asyncio.Event().wait()
     
     async def stop(self):
@@ -1782,6 +1590,10 @@ Are you sure you want to delete the job <b>"{job['job_name']}"</b>?
         for job_id in list(self.active_jobs.keys()):
             self.active_jobs[job_id] = False
         
+        for job_id, task in self.job_tasks.items():
+            if not task.done():
+                task.cancel()
+
         await self.app.stop()
         logger.info("Bot stopped.")
 
